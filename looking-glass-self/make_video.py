@@ -1,181 +1,237 @@
 """
-生成竖屏短视频：《“我眼中的别人眼中的我”的证明》
+生成竖屏短视频《照见》：以禅意的方式重述
+“别人眼中的自己不是真的自己，我眼中的别人眼中的自己才是真的自己”。
 
-流程：离线语音合成（sherpa-onnx + Matcha 中文模型）→ 按语音时长排布时间轴
-→ Pillow 逐帧绘制（2 倍超采样）→ 合成背景音乐 → ffmpeg 封装 H.264/AAC。
+流程：语音合成（优先 MiniMax T2A，未配置密钥时回退到离线 sherpa-onnx 模型）
+→ 按语音时长排布时间轴 → Pillow 逐帧绘制水墨风格画面（2 倍超采样）
+→ 程序合成古琴式拨弦与颂钵背景音 → ffmpeg 封装 H.264/AAC 并做响度标准化。
 
-用法：python3 make_video.py [--assets DIR] [--out OUT.mp4] [--preview SECONDS]
-资源（字体、语音模型）由 fetch_assets.sh 下载到 DIR（默认 ./assets）。
+用法：
+  export MINIMAX_API_KEY=...            # 可选；不设置则使用离线语音
+  python3 make_video.py [--assets DIR] [--out OUT.mp4] [--cover COVER.png]
+  python3 make_video.py --preview 12.5  # 仅导出第 12.5 秒的单帧
 """
 import argparse
 import hashlib
+import json
 import math
 import os
 import subprocess
+import urllib.request
 import wave
 from multiprocessing import Pool
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-W, H, FPS, S = 1080, 1920, 30, 2          # 输出分辨率、帧率、超采样倍数
-SR = 44100                                # 混音采样率
-SPEED = 1.22                              # 语速
+W, H, FPS, S = 1080, 1920, 30, 2      # 输出分辨率、帧率、超采样倍数
+SR = 44100
 
-BG = (14, 17, 24)
-TEXT = (238, 234, 226)
-MUTED = (128, 136, 150)
-DIM = (62, 68, 80)
-AMBER = (245, 178, 66)     # 真实的我 X
-CYAN = (88, 198, 216)      # 别人眼中的我 f(X)
-VIOLET = (172, 142, 245)   # 我眼中的别人眼中的我 g(f(X))
-RED = (226, 96, 104)
+PAPER = (241, 236, 226)               # 宣纸底色
+INK = (36, 33, 30)                    # 浓墨
+GREY = (128, 120, 110)                # 淡墨
+FAINT = (205, 197, 184)               # 极淡墨
+SEAL = (176, 48, 38)                  # 朱砂印
 
-ARGS = None
-GA = 1.0                   # 当前帧的全局不透明度（用于转场）
+LEAD, GAP, TAIL, FINAL_HOLD = 0.55, 0.42, 0.75, 3.2
+TEXT_Y = 1330                         # 文案区中心
 
-# ---------------------------------------------------------------- 文案与分镜
-# 每个场景：step（顶部进度标识）、lines（字幕/旁白），旁白文本可用 say 覆盖。
+# ---------------------------------------------------------------- 文案
+# show：画面文字；say：旁白（缺省同 show）；keep：下一句出现时保留并与之上下排列；
+# note：出处等小字。
 SCENES = [
-    dict(key="hook", step=None, lines=[
-        "有一句话，听起来很绕：",
-        "别人眼中的自己，不是真的自己；",
-        "我眼中的别人眼中的自己，才是真的自己。",
-        "下面分三步，给出它的证明。",
+    dict(key="enso", lines=[
+        dict(show="有人说，"),
+        dict(show="别人眼中的你，不是真的你；", keep=True),
+        dict(show="你眼中的别人眼中的你，才是。"),
     ]),
-    dict(key="define", step=0, lines=[
-        ("先作定义：真实的我，记作 X。", "先作定义：真实的我，记作艾克斯。"),
-        "别人看我，要经过他的经历、偏好和情绪的过滤，",
-        "得到的像，就是“别人眼中的我”。",
+    dict(key="moon", lines=[
+        dict(show="千江有水千江月。", note="—— 禅家语"),
+        dict(show="一千双眼睛里，有一千个你。"),
+        dict(show="那些你，你一个也看不见。"),
+        dict(show="你看见的，只是自己以为的那一个。"),
     ]),
-    dict(key="step1", step=1, lines=[
-        "第一步。同一个我，在一百个人眼中，",
-        "会呈现一百种不同的形象。",
-        "这些形象彼此矛盾，不可能都等于真实的我。",
-        "所以，别人眼中的自己，不是真的自己。",
+    dict(key="daily", lines=[
+        dict(show="出门前换下的衣裳，", keep=True),
+        dict(show="发出前删去的那句话，"),
+        dict(show="都在回应那个“以为”。"),
     ]),
-    dict(key="step2", step=2, lines=[
-        "第二步。别人眼中的我，存在于别人的头脑里，",
-        "我无法直接看到。",
-        "我能看到的，只是我对它的推测，",
-        "也就是：我眼中的别人眼中的我。",
+    dict(key="flag", lines=[
+        dict(show="不是风动，不是幡动，", keep=True),
+        dict(show="仁者心动。", note="——《六祖坛经》"),
+        dict(show="照见你的，从来是你自己的心。"),
     ]),
-    dict(key="step3", step=3, lines=[
-        "第三步。回想一下：",
-        "出门前换掉的那件衣服，",
-        "发送前删掉的那句话，",
-        "会议上没有说出口的那个想法。",
-        "决定这些的，并不是别人真实的看法，",
-        "而是“我以为别人会怎么看”。",
-    ]),
-    dict(key="qed", step=4, lines=[
-        "一个人的言行、选择乃至情绪，都由这个“以为”决定。",
-        "因此，真正塑造“我”的，是我眼中的别人眼中的我。",
-        "证毕。",
-    ]),
-    dict(key="theory", step=None, lines=[
-        "这并不只是一个段子。",
-        ("1902年，美国社会学家库利提出“镜中自我”理论：",
-         "一九零二年，美国社会学家库利，提出镜中自我理论："),
-        "人通过想象他人如何看待自己，来形成对自我的认知。",
-    ]),
-    dict(key="mirror", step=None, lines=[
-        "所以，与其反复揣测别人怎么看你，",
-        "不如检查一下你心里的那面镜子：",
-        "它是否放大了缺点，又忽略了优点？",
-        "镜子是自己挂上的，也能由自己擦亮。",
-        "你心里的那面镜子，照出的是怎样的你？",
+    dict(key="mirror", lines=[
+        dict(show="心镜蒙尘，处处都是审视；", keep=True),
+        dict(show="拂去尘埃，"),
+        dict(show="别人如何看你，便只是别人的事。"),
+        dict(show="愿你照见，本来面目。", final=True),
     ]),
 ]
-STEPS = ["定义", "第一步", "第二步", "第三步", "证毕"]
-LEAD, GAP, TAIL, FINAL_HOLD = 0.35, 0.24, 0.6, 3.0
+
+ARGS = None
+GA = 1.0
 
 
 # ---------------------------------------------------------------- 语音合成
-def tts_engine(assets):
-    import sherpa_onnx
-    d = os.path.join(assets, "matcha-icefall-zh-baker")
-    cfg = sherpa_onnx.OfflineTtsConfig(
-        model=sherpa_onnx.OfflineTtsModelConfig(
-            matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-                acoustic_model=f"{d}/model-steps-3.onnx",
-                vocoder=os.path.join(assets, "vocos-22khz-univ.onnx"),
-                lexicon=f"{d}/lexicon.txt", tokens=f"{d}/tokens.txt",
-                dict_dir=f"{d}/dict"),
-            num_threads=4),
-        rule_fsts=f"{d}/phone.fst,{d}/date.fst,{d}/number.fst")
-    return sherpa_onnx.OfflineTts(cfg)
+def to_samples(path):
+    """用 ffmpeg 将任意音频解码为 SR 采样率的单声道 float32。"""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-ac", "1",
+                          "-ar", str(SR), "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.float32).copy()
 
 
-def synth_lines(assets, cache):
-    """为每一行旁白合成语音，返回 [(scene_idx, line_idx, show, samples@SR)]。"""
+def trim(x):
+    nz = np.where(np.abs(x) > 0.01)[0]
+    return x[max(nz[0] - 600, 0): nz[-1] + 2500] if len(nz) else x
+
+
+class MiniMaxTTS:
+    def __init__(self, key, voice, model, speed, hosts):
+        self.key, self.voice, self.model, self.speed, self.hosts = key, voice, model, speed, hosts
+        self.tag = f"minimax|{voice}|{model}|{speed}"
+
+    def __call__(self, text, out_mp3):
+        body = json.dumps({
+            "model": self.model, "text": text, "stream": False, "language_boost": "Chinese",
+            "voice_setting": {"voice_id": self.voice, "speed": self.speed, "vol": 1.0, "pitch": 0},
+            "audio_setting": {"sample_rate": 44100, "bitrate": 128000, "format": "mp3", "channel": 1},
+        }).encode()
+        err = None
+        for host in self.hosts:
+            req = urllib.request.Request(f"https://{host}/v1/t2a_v2", data=body, headers={
+                "Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    res = json.loads(r.read())
+            except Exception as e:      # 网络不可达时尝试下一个地址
+                err = e
+                continue
+            base = res.get("base_resp", {})
+            if base.get("status_code", 0) != 0 or not res.get("data", {}).get("audio"):
+                err = RuntimeError(f"{host}: {base}")
+                continue
+            with open(out_mp3, "wb") as f:
+                f.write(bytes.fromhex(res["data"]["audio"]))
+            return
+        raise RuntimeError(f"MiniMax 语音合成失败：{err}")
+
+
+class LocalTTS:
+    def __init__(self, assets, speed):
+        import sherpa_onnx
+        d = os.path.join(assets, "matcha-icefall-zh-baker")
+        cfg = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                    acoustic_model=f"{d}/model-steps-3.onnx",
+                    vocoder=os.path.join(assets, "vocos-22khz-univ.onnx"),
+                    lexicon=f"{d}/lexicon.txt", tokens=f"{d}/tokens.txt", dict_dir=f"{d}/dict"),
+                num_threads=4),
+            rule_fsts=f"{d}/phone.fst,{d}/date.fst,{d}/number.fst")
+        self.eng, self.speed, self.tag = sherpa_onnx.OfflineTts(cfg), speed, f"local|{speed}"
+
+    def __call__(self, text, out_wav):
+        a = self.eng.generate(text, sid=0, speed=self.speed)
+        s = (np.clip(np.array(a.samples), -1, 1) * 32767).astype(np.int16)
+        with wave.open(out_wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(a.sample_rate)
+            w.writeframes(s.tobytes())
+
+
+def make_tts(args):
+    key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    if key:
+        hosts = [h for h in [os.environ.get("MINIMAX_API_HOST")] if h] or \
+            ["api.minimaxi.com", "api.minimax.io"]
+        return MiniMaxTTS(key, args.voice, args.model, args.speed, hosts)
+    print("未设置 MINIMAX_API_KEY，使用离线语音模型")
+    return LocalTTS(args.assets, 0.95)
+
+
+def synth_lines(args):
+    cache = os.path.join(args.assets, "tts_cache")
     os.makedirs(cache, exist_ok=True)
-    eng, out = None, []
+    tts, out = make_tts(args), []
     for si, sc in enumerate(SCENES):
-        for li, ln in enumerate(sc["lines"]):
-            show, say = (ln if isinstance(ln, tuple) else (ln, ln))
-            path = os.path.join(cache, hashlib.md5(f"{say}|{SPEED}".encode()).hexdigest() + ".npy")
-            if not os.path.exists(path):
-                eng = eng or tts_engine(assets)
-                a = eng.generate(say, sid=0, speed=SPEED)
-                x = np.array(a.samples, dtype=np.float32)
-                # 线性插值重采样到 SR，并裁去首尾静音
-                n = int(len(x) * SR / a.sample_rate)
-                x = np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x)
-                nz = np.where(np.abs(x) > 0.01)[0]
-                x = x[max(nz[0] - 800, 0): nz[-1] + 2000] if len(nz) else x
-                np.save(path, x.astype(np.float32))
-            out.append((si, li, show, np.load(path)))
+        for ln in sc["lines"]:
+            say = ln.get("say", ln["show"])
+            h = hashlib.md5(f"{tts.tag}|{say}".encode()).hexdigest()
+            npy = os.path.join(cache, h + ".npy")
+            if not os.path.exists(npy):
+                tmp = os.path.join(cache, h + (".mp3" if isinstance(tts, MiniMaxTTS) else ".wav"))
+                tts(say, tmp)
+                np.save(npy, trim(to_samples(tmp)))
+                os.remove(tmp)
+            out.append((si, ln, np.load(npy)))
     return out
 
 
 def build_timeline(voice):
-    """计算每个场景起止时间与每行字幕的起止时间（秒）。"""
     scenes, t = [], 0.0
     for si, sc in enumerate(SCENES):
         start, cur, lines = t, t + LEAD, []
-        for (vsi, li, show, x) in voice:
+        for vsi, ln, x in voice:
             if vsi != si:
                 continue
             d = len(x) / SR
-            lines.append(dict(show=show, t0=cur, t1=cur + d, audio=x))
-            cur += d + GAP
+            lines.append(dict(ln, t0=cur, t1=cur + d, audio=x))
+            cur += d + GAP + (0.35 if ln.get("note") else 0)
         end = cur - GAP + (FINAL_HOLD if si == len(SCENES) - 1 else TAIL)
         scenes.append(dict(sc, start=start, end=end, lines=lines))
         t = end
     return scenes, t
 
 
-# ---------------------------------------------------------------- 背景音乐
-def make_music(total):
+# ---------------------------------------------------------------- 背景音
+def pluck(freq, dur, decay=0.996):
+    """Karplus–Strong 拨弦，音色近似古琴。按周期分块向量化计算。"""
+    n, N = int(dur * SR), max(int(SR / freq), 2)
+    rng = np.random.default_rng(int(freq * 10))
+    y = np.zeros(n + N + 2)                    # y[0] 为补零，激励位于 y[1:N+1]
+    y[1:N + 1] = rng.uniform(-1, 1, N) * np.hanning(N)
+    for k in range(1, (n // N) + 1):
+        a, b = 1 + k * N, min(1 + (k + 1) * N, n + N + 2)
+        y[a:b] = decay * 0.5 * (y[a - N:b - N] + y[a - N - 1:b - N - 1])
+    out = y[1:n + 1]
+    return out * np.minimum(1, np.arange(n) / 80)
+
+
+def bowl(dur, f0=196.0):
+    t = np.arange(int(dur * SR)) / SR
+    out = np.zeros_like(t)
+    for ratio, amp, tau in [(1, 1.0, 6.0), (2.76, 0.5, 3.5), (5.40, 0.25, 1.8), (8.93, 0.12, 0.9)]:
+        f = f0 * ratio
+        out += amp * np.exp(-t / tau) * (np.sin(2 * np.pi * f * t) + 0.6 * np.sin(2 * np.pi * (f + 1.3) * t))
+    return out * np.minimum(1, t / 0.01)
+
+
+def make_music(total, final_t):
     n = int(total * SR)
     t = np.arange(n) / SR
-    out = np.zeros(n, dtype=np.float64)
-    hz = lambda m: 440.0 * 2 ** ((m - 69) / 12)
-    chords = [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]]   # Am F C G
-    bar = 4.0
-    for k in range(int(total / bar) + 2):
-        c = chords[k % 4]
-        s0, s1 = int(k * bar * SR), min(int((k + 1) * bar * SR + 1.5 * SR), n)
-        if s0 >= n:
-            break
-        tt = t[s0:s1] - k * bar
-        env = np.minimum(tt / 1.2, 1.0) * np.exp(-np.maximum(tt - bar, 0) / 0.6)
-        seg = np.zeros_like(tt)
-        for m in c + [c[0] + 12]:
-            f = hz(m)
-            seg += np.sin(2 * np.pi * f * tt) + 0.25 * np.sin(4 * np.pi * f * tt + 0.3)
-        seg += 0.8 * np.sin(2 * np.pi * hz(c[0] - 12) * tt)              # 低音
-        out[s0:s1] += seg * env
-        # 每小节两个轻柔的拨弦音
-        for j, m in enumerate([c[2] + 12, c[1] + 12]):
-            p0 = int((k * bar + j * 2.0) * SR)
-            if p0 < n:
-                pt = np.arange(min(int(1.6 * SR), n - p0)) / SR
-                out[p0:p0 + len(pt)] += 0.5 * np.sin(2 * np.pi * hz(m) * pt) * np.exp(-pt / 0.35)
+    out = np.zeros(n)
+    # 低沉的持续音
+    out += 0.05 * (np.sin(2 * np.pi * 73.4 * t) + 0.6 * np.sin(2 * np.pi * 110 * t)) * \
+        (0.7 + 0.3 * np.sin(2 * np.pi * t / 9))
+    # 稀疏的五声音阶拨弦（D 羽调式）
+    scale = [146.8, 174.6, 196.0, 220.0, 261.6, 293.7, 349.2, 392.0]
+    rng = np.random.default_rng(7)
+    tt = 1.2
+    while tt < total - 3:
+        for j, f in enumerate([scale[rng.integers(0, 6)]] + ([scale[rng.integers(3, 8)]] if rng.random() < 0.35 else [])):
+            p = pluck(f, 3.5)
+            s = int((tt + j * 0.18) * SR)
+            e = min(s + len(p), n)
+            out[s:e] += 0.32 * p[:e - s]
+        tt += rng.choice([2.4, 3.2, 4.0])
+    for at in (0.0, final_t):              # 开篇与结尾的颂钵
+        b = bowl(min(8.0, total - at))
+        s = int(at * SR)
+        out[s:s + len(b)] += 0.22 * b[:n - s]
     out /= np.max(np.abs(out)) + 1e-9
-    fade = np.minimum(1, np.minimum(t / 1.5, (total - t) / 2.5))
-    return out * fade * 0.075
+    return out * np.minimum(1, np.minimum(t / 1.0, (total - t) / 2.5)) * 0.16
 
 
 def make_audio(scenes, total, path):
@@ -186,8 +242,8 @@ def make_audio(scenes, total, path):
             s = int(ln["t0"] * SR)
             voice[s:s + len(ln["audio"])] += ln["audio"]
     voice *= 0.89 / (np.max(np.abs(voice)) + 1e-9)
-    mix = voice + make_music(n / SR)
-    mix = np.clip(mix, -1, 1)
+    final_t = scenes[-1]["lines"][-1]["t0"] - 0.3
+    mix = np.clip(voice + make_music(n / SR, final_t), -1, 1)
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -202,23 +258,23 @@ _fonts = {}
 def F(kind, size):
     key = (kind, size)
     if key not in _fonts:
-        name = {"sans": "NotoSansSC-Regular.otf", "bold": "NotoSansSC-Bold.otf",
-                "serif": "NotoSerifSC-Bold.otf"}[kind]
+        name = {"serif": "NotoSerifSC-Medium.otf", "light": "NotoSerifSC-Regular.otf",
+                "bold": "NotoSerifSC-Bold.otf"}[kind]
         _fonts[key] = ImageFont.truetype(os.path.join(ARGS.assets, "fonts", name), size * S)
     return _fonts[key]
 
 
 def C(col, a=1.0):
     a = max(0.0, min(1.0, a * GA))
-    return tuple(int(BG[i] + (col[i] - BG[i]) * a) for i in range(3))
+    return tuple(int(PAPER[i] + (col[i] - PAPER[i]) * a) for i in range(3))
 
 
 def ease(x):
     x = max(0.0, min(1.0, x))
-    return 1 - (1 - x) ** 3
+    return x * x * (3 - 2 * x)
 
 
-def fade(t, t0, dur=0.45):
+def fade(t, t0, dur=0.8):
     return ease((t - t0) / dur)
 
 
@@ -226,317 +282,250 @@ def P(*v):
     return [int(round(u * S)) for u in v]
 
 
-def text(d, s, x, y, size, col, a=1.0, kind="bold", anchor="mm"):
+def text(d, s, x, y, size, col=INK, a=1.0, kind="serif", anchor="mm", bleed=True):
+    """墨迹晕开式出现：未完全显现时，外圈有一层随之收拢的淡墨。"""
     if a <= 0.01:
         return
-    d.text(P(x, y), s, font=F(kind, size), fill=C(col, a), anchor=anchor)
+    f = F(kind, size)
+    if bleed and a < 0.999:
+        d.text(P(x, y), s, font=f, fill=C(col, 0.22 * a), anchor=anchor,
+               stroke_width=max(1, round(5 * S * (1 - a))), stroke_fill=C(col, 0.12 * a))
+    d.text(P(x, y), s, font=f, fill=C(col, a), anchor=anchor)
 
 
-def rich(d, segs, cx, y, size, a=1.0, kind="bold"):
-    """居中绘制多色文本。segs: [(文本, 颜色)] 或 [(文本, 颜色, 'sub')]。"""
-    if a <= 0.01:
-        return
-    parts = []
-    for sg in segs:
-        sub = len(sg) > 2
-        f = F(kind, int(size * 0.55) if sub else size)
-        parts.append((sg[0], sg[1], f, sub, f.getlength(sg[0]) / S))
-    x = cx - sum(p[4] for p in parts) / 2
-    for s, col, f, sub, w in parts:
-        yy = y + (size * 0.28 if sub else 0)
-        d.text(P(x, yy), s, font=f, fill=C(col, a), anchor="lm")
-        x += w
+def vtext(d, s, x, y, size, col=INK, a=1.0, kind="serif", gap=1.08):
+    """竖排文字，(x, y) 为首字中心。"""
+    for i, ch in enumerate(s):
+        text(d, ch, x, y + i * size * gap, size, col, a, kind)
 
 
-def circle(d, x, y, r, col, a=1.0, width=4, fill=None):
-    if a <= 0.01:
-        return
-    d.ellipse(P(x - r, y - r, x + r, y + r), outline=C(col, a), width=width * S,
-              fill=C(fill[0], fill[1] * a) if fill else None)
+_enso_cache = {}
 
 
-def rrect(d, x0, y0, x1, y1, col, a=1.0, width=3, fill=None, r=18):
-    if a <= 0.01:
-        return
-    d.rounded_rectangle(P(x0, y0, x1, y1), radius=r * S, outline=C(col, a) if col else None,
-                        width=width * S, fill=C(fill[0], fill[1] * a) if fill else None)
-
-
-def arrow(d, x0, y0, x1, y1, col, a=1.0, prog=1.0, width=4, dashed=False, head=18):
+def enso(d, cx, cy, r, prog, col=INK, a=1.0, w=30, seed=0, start=-105):
+    """书法“圆相”：起笔饱满，收笔渐细并带飞白。prog ∈ [0, 1] 为书写进度。"""
     if a <= 0.01 or prog <= 0:
         return
-    prog = ease(prog)
-    xe, ye = x0 + (x1 - x0) * prog, y0 + (y1 - y0) * prog
-    if dashed:
-        L = math.hypot(xe - x0, ye - y0)
-        n = int(L // 22)
-        for i in range(n + 1):
-            u0, u1 = i * 22 / max(L, 1), min((i * 22 + 12) / max(L, 1), 1)
-            if u0 >= 1:
-                break
-            d.line(P(x0 + (xe - x0) * u0, y0 + (ye - y0) * u0, x0 + (xe - x0) * u1,
-                     y0 + (ye - y0) * u1), fill=C(col, a), width=width * S)
-    else:
-        d.line(P(x0, y0, xe, ye), fill=C(col, a), width=width * S)
-    if prog > 0.85:
-        ang = math.atan2(y1 - y0, x1 - x0)
-        pts = [(xe, ye), (xe - head * math.cos(ang - 0.45), ye - head * math.sin(ang - 0.45)),
-               (xe - head * math.cos(ang + 0.45), ye - head * math.sin(ang + 0.45))]
-        d.polygon([tuple(P(*p)) for p in pts], fill=C(col, a))
+    key = (cx, cy, r, w, seed, start)
+    if key not in _enso_cache:
+        rng = np.random.default_rng(seed)
+        n = 520
+        pts = []
+        for i in range(n):
+            u = i / (n - 1)
+            th = math.radians(start + 335 * u)
+            rr = r * (1 + 0.018 * math.sin(3 * th + seed) + 0.01 * math.sin(7 * th))
+            width = w * (0.8 + 0.25 * math.sin(math.pi * min(u * 1.3, 1))) * (1 - 0.78 * u ** 2.2)
+            x, y = cx + rr * math.cos(th), cy + rr * math.sin(th)
+            nx, ny = math.cos(th), math.sin(th)
+            # 飞白：收笔段由若干“笔毛”组成，随机断开
+            dry = max(0.0, (u - 0.55) / 0.45)
+            bristles = []
+            for b in np.linspace(-0.5, 0.5, 7):
+                if rng.random() > dry * 0.75:
+                    bristles.append((x + nx * b * width, y + ny * b * width,
+                                     width / 7 * (1.1 + 0.4 * rng.random())))
+            pts.append((u, x, y, width / 2, dry, bristles))
+        _enso_cache[key] = pts
+    for u, x, y, hw, dry, bristles in _enso_cache[key]:
+        if u > prog:
+            break
+        if dry < 0.15:
+            d.ellipse(P(x - hw, y - hw, x + hw, y + hw), fill=C(col, a))
+        else:
+            for bx, by, br in bristles:
+                d.ellipse(P(bx - br, by - br, bx + br, by + br), fill=C(col, a * (1 - 0.25 * dry)))
 
 
-def blob(d, x, y, r, col, a=1.0, seed=0, amp=0.16, t=0.0, width=4, fill=0.14):
-    """不规则的“像”：表示经过过滤、发生畸变的形象。"""
+def stroke(d, pts, col, a, width):
+    if a > 0.01 and len(pts) > 1:
+        d.line([tuple(P(*p)) for p in pts], fill=C(col, a), width=max(1, round(width * S)), joint="curve")
+
+
+def seal(d, s, x, y, size, a=1.0):
+    """朱文方印（两字竖排）。"""
     if a <= 0.01:
         return
-    rng = np.random.default_rng(seed)
-    ks, ph = rng.integers(2, 6, 3), rng.uniform(0, 6.28, 3)
-    pts = []
-    for i in range(96):
-        th = 2 * math.pi * i / 96
-        rr = r * (1 + amp * sum(math.sin(k * th + p + 0.6 * t) for k, p in zip(ks, ph)) / 2)
-        pts.append(tuple(P(x + rr * math.cos(th), y + rr * math.sin(th))))
-    d.polygon(pts, fill=C(col, fill * a))
-    d.line(pts + [pts[0]], fill=C(col, a), width=width * S, joint="curve")
+    sc = 1 + 0.25 * (1 - a)
+    h = size * 1.15 * sc
+    d.rounded_rectangle(P(x - h / 2, y - h, x + h / 2, y + h), radius=6 * S, fill=C(SEAL, a))
+    for i, ch in enumerate(s):
+        d.text(P(x, y - h / 2 + i * h), ch, font=F("bold", int(size * sc)), fill=C(PAPER, 1.0)
+               if a > 0.98 else C(SEAL, a * 0.2), anchor="mm")
 
 
-def person(d, x, y, r, col, a=1.0, width=4):
-    """简笔人像：头部 + 肩部。(x, y) 为头部中心。"""
-    if a <= 0.01:
-        return
-    circle(d, x, y, r, col, a, width)
-    d.arc(P(x - 1.7 * r, y + 1.25 * r, x + 1.7 * r, y + 4.4 * r), 180, 360,
-          fill=C(col, a), width=width * S)
+# ---------------------------------------------------------------- 各场景画面
+def sc_enso(d, t, ts):
+    enso(d, 540, 720, 250, 0.3 + t / 2.0, INK, 1.0, 34, seed=1)
+    enso(d, 600, 690, 165, (t - ts[1]) / 2.0, GREY, 0.7, 18, seed=2, start=60)
+    enso(d, 500, 760, 95, (t - ts[2]) / 1.8, SEAL, 0.75, 12, seed=3, start=200)
 
 
-def bubble(d, x, y, rx, ry, col, a=1.0, width=3, fill=None, tail=None):
-    if a <= 0.01:
-        return
-    d.ellipse(P(x - rx, y - ry, x + rx, y + ry), outline=C(col, a), width=width * S,
-              fill=C(fill[0], fill[1] * a) if fill else None)
-    if tail:
-        for i, (fx, rr) in enumerate([(0.35, 12), (0.7, 7)]):
-            cx, cy = x + (tail[0] - x) * fx, y + ry + (tail[1] - y - ry) * fx
-            circle(d, cx, cy, rr, col, a, width)
+def sc_moon(d, t, ts):
+    a = fade(t, 0, 1.2)
+    d.ellipse(P(540 - 92, 410 - 92, 540 + 92, 410 + 92), fill=C(FAINT, 0.55 * a), outline=C(INK, a),
+              width=3 * S)
+    rows = [650, 755, 860, 965, 1070]
+    mist = fade(t, ts[2], 1.2)
+    clear = fade(t, ts[3], 1.0)
+    for k, y in enumerate(rows):
+        ak = fade(t, ts[0] + 0.25 + 0.35 * k if k < 2 else ts[1] + 0.3 * (k - 2), 1.0)
+        mine = k == 4
+        # 水波
+        pts = [(x, y + 26 + 4 * math.sin(x / 38 + t * 1.3 + k)) for x in range(110, 971, 12)]
+        stroke(d, pts, GREY, ak * 0.55, 2)
+        # 倒影：被水波打碎的月
+        ra = ak * (1 - 0.75 * mist) if not mine else ak * (1 - 0.75 * mist + 0.75 * clear)
+        col = INK if (mine and clear > 0) else GREY
+        xo = 540 + (k - 2) * 110 + 10 * math.sin(t * 0.9 + k * 1.7)
+        for j in range(-3, 4):
+            seg = 78 * math.sqrt(max(0, 1 - (j / 3.6) ** 2))
+            jit = 8 * math.sin(t * 2.1 + j * 1.3 + k)
+            stroke(d, [(xo - seg + jit, y + j * 9), (xo + seg + jit, y + j * 9)], col, ra, 5)
 
 
-def tag(d, s, x, y, size, col, a=1.0, fill=0.12):
-    if a <= 0.01:
-        return
-    w = F("bold", size).getlength(s) / S
-    rrect(d, x - w / 2 - 22, y - size * 0.85, x + w / 2 + 22, y + size * 0.85, col, a, 3,
-          fill=(col, fill), r=int(size * 0.85))
-    text(d, s, x, y, size, col, a)
+def hanger(d, x, y, a):
+    stroke(d, [(x, y - 70), (x, y - 92)], INK, a, 3)
+    d.arc(P(x - 14, y - 120, x + 14, y - 92), 0, 200, fill=C(INK, a), width=3 * S)
+    stroke(d, [(x - 110, y), (x, y - 70), (x + 110, y), (x - 110, y)], INK, a, 3)
+    # 衣裳
+    stroke(d, [(x - 95, y + 4), (x - 140, y + 70), (x - 105, y + 92), (x - 80, y + 60), (x - 80, y + 230),
+               (x + 80, y + 230), (x + 80, y + 60), (x + 105, y + 92), (x + 140, y + 70), (x + 95, y + 4)],
+           INK, a, 3)
 
 
-def conclusion(d, label, body, y, a, col=AMBER):
-    """引理/结论框。"""
-    if a <= 0.01:
-        return
-    dy = (1 - a) * 30
-    rrect(d, 70, y - 62 + dy, 1010, y + 62 + dy, col, a, 3, fill=(col, 0.08), r=22)
-    text(d, label, 110, y + dy, 38, col, a, "bold", "lm")
-    text(d, body, 110 + F("bold", 38).getlength(label) / S + 18, y + dy, 38, TEXT, a, "bold", "lm")
+def chat(d, x, y, a, erase):
+    d.rounded_rectangle(P(x - 150, y - 90, x + 150, y + 110), radius=28 * S, outline=C(INK, a), width=3 * S)
+    d.polygon([tuple(P(x - 90, y + 108)), tuple(P(x - 120, y + 150)), tuple(P(x - 50, y + 108))],
+              fill=C(PAPER, 1), outline=None)
+    stroke(d, [(x - 90, y + 110), (x - 120, y + 150), (x - 50, y + 110)], INK, a, 3)
+    stroke(d, [(x - 105, y - 40), (x + 95, y - 40)], GREY, a, 6)
+    stroke(d, [(x - 105, y + 10), (x + 60, y + 10)], GREY, a, 6)
+    e = 1 - erase
+    if e > 0.02:
+        stroke(d, [(x - 105, y + 60), (x - 105 + 180 * e, y + 60)], GREY, a, 6)
+    if erase < 1:   # 光标
+        cx = x - 105 + 180 * e + 10
+        if int(t_global * 2) % 2 == 0:
+            stroke(d, [(cx, y + 42), (cx, y + 78)], INK, a, 3)
+
+
+t_global = 0.0
+
+
+def sc_daily(d, t, ts):
+    dim = 1 - 0.65 * fade(t, ts[2], 1.0)
+    hanger(d, 300, 560, fade(t, ts[0]) * dim)
+    chat(d, 760, 620, fade(t, ts[1]) * dim, fade(t, ts[1] + 1.0, 1.2))
+    a = fade(t, ts[2] + 0.2, 1.2)
+    stroke(d, [(300, 800), (520, 960)], GREY, a * 0.6, 2)
+    stroke(d, [(760, 780), (560, 960)], GREY, a * 0.6, 2)
+    text(d, "以为", 540, 1040, 120, INK, a, "bold")
+
+
+def sc_flag(d, t, ts):
+    still = fade(t, ts[1], 1.8)                    # “仁者心动”：风止幡静
+    a = fade(t, 0, 1.0)
+    px = 330
+    # 风（先画，位于幡与旗杆之后）
+    wind = a * (1 - still)
+    for k in range(4):
+        ph = (t * 0.35 + k * 0.27) % 1.0
+        x0 = -200 + 1400 * ph
+        y0 = 470 + k * 120
+        pts = [(x0 + s, y0 + 18 * math.sin(s / 60 + k)) for s in range(0, 260, 10)]
+        stroke(d, pts, GREY, wind * 0.7 * math.sin(math.pi * ph), 3)
+    stroke(d, [(px, 360), (px, 1110)], INK, a, 7)
+    stroke(d, [(px - 10, 380), (px + 150, 380)], INK, a, 6)
+    amp = 46 * (1 - still)
+    left, right = [], []
+    for i in range(41):
+        u = i / 40
+        y = 390 + 470 * u
+        dx = amp * u ** 1.3 * math.sin(2 * math.pi * (u * 1.4) - t * 3.2)
+        left.append((px + 20 + dx, y))
+        right.append((px + 140 + dx + 0.4 * amp * u * math.sin(-t * 3.2 + 1), y))
+    poly = left + right[::-1]
+    d.polygon([tuple(P(*p)) for p in poly], fill=C(FAINT, 0.6 * a), outline=None)
+    stroke(d, poly + [poly[0]], INK, a, 3)
+    # 心
+    enso(d, 760, 700, 125, (t - ts[1] - 0.3) / 1.6, INK, 1.0, 16, seed=5)
+    text(d, "心", 760, 700, 120, INK, fade(t, ts[1] + 1.0, 1.0), "bold")
+
+
+_dust = None
+
+
+def sc_mirror(d, t, ts):
+    global _dust
+    cx, cy, r = 540, 720, 245
+    enso(d, cx, cy, r, 1.0, INK, fade(t, 0, 1.0), 30, seed=8)
+    if _dust is None:
+        rng = np.random.default_rng(11)
+        ang, rad = rng.uniform(0, 2 * math.pi, 150), r * 0.82 * np.sqrt(rng.uniform(0, 1, 150))
+        _dust = [(cx + rr * math.cos(q), cy + rr * math.sin(q), rng.uniform(1.5, 7), rng.uniform(0.3, 0.8))
+                 for q, rr in zip(ang, rad)]
+    sweep = -200 + 1500 * ease((t - ts[1] - 0.1) / 1.6)       # 拂拭位置
+    a0 = fade(t, ts[0] - 0.2, 1.0)
+    for x, y, s, al in _dust:
+        if x + 0.35 * (y - cy) > sweep:
+            d.ellipse(P(x - s, y - s, x + s, y + s), fill=C(INK, a0 * al))
+    if 0 < sweep < 1300:                                       # 拂尘的一道淡墨
+        for k in range(10):
+            xs = sweep - 30 - k * 9
+            stroke(d, [(xs + 0.35 * 300, cy - 300), (xs - 0.35 * 300, cy + 300)], FAINT, 0.5 * (1 - k / 10), 6)
+    clean = fade(t, ts[2], 1.5)
+    if clean > 0:
+        d.ellipse(P(cx - 92, cy - 92, cx + 92, cy + 92), fill=C(FAINT, 0.55 * clean),
+                  outline=C(INK, clean), width=3 * S)
+    seal(d, "照见", 880, 1470, 40, fade(t, ts[3] + 1.0, 0.5))
+
+
+DRAW = {"enso": sc_enso, "moon": sc_moon, "daily": sc_daily, "flag": sc_flag, "mirror": sc_mirror}
 
 
 def wrap(s, size, maxw):
-    """字幕换行：需要两行时，优先在靠近中点的标点后断开，使两行长度均衡。"""
-    f = F("bold", size)
+    f = F("serif", size)
     if f.getlength(s) / S <= maxw:
         return [s]
     mid = len(s) / 2
     cands = [i + 1 for i, ch in enumerate(s[:-1]) if ch in "，、：；"]
     best = min(cands, key=lambda i: abs(i - mid), default=None)
-    k = best if best is not None and abs(best - mid) <= len(s) * 0.2 else round(mid)
+    k = best if best is not None and abs(best - mid) <= len(s) * 0.25 else round(mid)
     return [s[:k], s[k:]]
 
 
-# ---------------------------------------------------------------- 各场景画面
-def sc_hook(d, t, ts):
-    on = lambda i: 1.0 if (ts[i] <= t < (ts[i + 1] if i + 1 < len(ts) else 1e9)) else 0.55
-    tag(d, "命　题", 540, 430, 34, AMBER, fade(t, 0, 0.3))
-    a1 = fade(t, 0, 0.3) * (1.0 if t < ts[1] else on(1))
-    rich(d, [("别人眼中的", CYAN), ("自己", AMBER)], 540, 580, 74, a1, "serif")
-    rich(d, [("不是", TEXT), ("真的自己", TEXT)], 540, 680, 74, a1, "serif")
-    a2 = fade(t, 0, 0.3) * (1.0 if t < ts[1] else on(2))
-    rich(d, [("我眼中的", VIOLET), ("别人眼中的", CYAN), ("自己", AMBER)], 540, 850, 74, a2, "serif")
-    rich(d, [("才是", TEXT), ("真的自己", TEXT)], 540, 950, 74, a2, "serif")
-    for i in range(3):
-        a = fade(t, ts[3] + 0.25 * i)
-        circle(d, 360 + 180 * i, 1150, 46, AMBER, a, 3, fill=(AMBER, 0.12))
-        text(d, str(i + 1), 360 + 180 * i, 1148, 46, AMBER, a, "serif")
-    text(d, "三步证明", 540, 1245, 34, MUTED, fade(t, ts[3] + 0.6))
-
-
-def sc_define(d, t, ts):
-    a = fade(t, ts[0])
-    circle(d, 230, 720, 112, AMBER, a, 5, fill=(AMBER, 0.12))
-    text(d, "X", 230, 712, 100, AMBER, a, "serif")
-    text(d, "真实的我", 230, 880, 38, TEXT, a)
-    # 过滤器
-    a = fade(t, ts[1])
-    arrow(d, 352, 720, 470, 720, MUTED, a, (t - ts[1]) / 0.5)
-    rrect(d, 490, 560, 590, 880, CYAN, a * 0.8, 3, fill=(CYAN, 0.06), r=46)
-    for i in range(5):
-        yy = 600 + i * 60
-        d.line(P(510, yy + 20, 570, yy - 20), fill=C(CYAN, 0.35 * a), width=3 * S)
-    text(d, "过滤", 540, 520, 36, CYAN, a)
-    for i, w in enumerate(["经历", "偏好", "情绪"]):
-        tag(d, w, 540, 950 + i * 78, 30, MUTED, fade(t, ts[1] + 0.9 + 0.55 * i), 0.06)
-    # 像
-    a = fade(t, ts[2])
-    arrow(d, 610, 720, 728, 720, MUTED, a, (t - ts[2]) / 0.5)
-    blob(d, 860, 720, 112, CYAN, a, seed=3, t=t, width=5)
-    rich(d, [("f", CYAN), ("(", CYAN), ("X", AMBER), (")", CYAN)], 860, 712, 76, a, "serif")
-    text(d, "别人眼中的我", 860, 880, 38, TEXT, a)
-    text(d, "f：别人的观察（含过滤）", 540, 1220, 32, MUTED, fade(t, ts[2] + 0.8), "sans")
-
-
-LABELS = ["高冷", "热情", "靠谱", "敷衍", "有趣", "无聊"]
-
-
-def sc_step1(d, t, ts):
-    cx, cy = 540, 720
-    circle(d, cx, cy, 82, AMBER, fade(t, ts[0]), 5, fill=(AMBER, 0.12))
-    text(d, "X", cx, cy - 6, 80, AMBER, fade(t, ts[0]), "serif")
-    for i in range(6):
-        ang = -math.pi / 2 + i * math.pi / 3
-        px, py = cx + 215 * math.cos(ang), cy + 215 * math.sin(ang)
-        a = fade(t, ts[0] + 0.5 + 0.12 * i)
-        person(d, px, py - 20, 18, CYAN, a * 0.85, 3)
-        a2 = fade(t, ts[1] + 0.15 * i)
-        bx, by = cx + 375 * math.cos(ang), cy + 335 * math.sin(ang)
-        blob(d, bx, by, 62, CYAN, a2, seed=10 + i, amp=0.22, t=t, width=3, fill=0.1)
-        text(d, LABELS[i], bx, by - 2, 34, TEXT, a2)
-    a3 = fade(t, ts[2]) * (1 - fade(t, ts[3], 0.3))
-    rich(d, [("f", CYAN), ("1", CYAN, "sub"), ("(X)", CYAN), ("  ≠  ", TEXT), ("f", CYAN),
-             ("2", CYAN, "sub"), ("(X)", CYAN), ("  ≠ … ≠  ", TEXT), ("X", AMBER)],
-         540, 1235, 54, a3, "serif")
-    conclusion(d, "引理一", "别人眼中的我 ≠ 真实的我", 1235, fade(t, ts[3] + 0.2))
-
-
-def sc_step2(d, t, ts):
-    # 他人
-    a = fade(t, ts[0])
-    person(d, 800, 760, 62, CYAN, a, 5)
-    text(d, "别人", 800, 1010, 36, CYAN, a)
-    bubble(d, 790, 470, 175, 115, CYAN, a, 3, fill=(CYAN, 0.06), tail=(800, 680))
-    hide = fade(t, ts[1], 0.6)
-    blob(d, 740, 470, 48, CYAN, a * (1 - hide), seed=3, t=t, width=3)
-    rich(d, [("f", CYAN), ("(", CYAN), ("X", AMBER), (")", CYAN)], 850, 470, 50, a * (1 - hide), "serif")
-    if hide > 0:
-        d.ellipse(P(790 - 175, 470 - 115, 790 + 175, 470 + 115), fill=C(DIM, hide * 0.9))
-        text(d, "？", 790, 445, 100, TEXT, hide, "serif")
-        text(d, "无法直接观测", 790, 530, 28, MUTED, hide)
-    # 我
-    a = fade(t, ts[0] + 0.3)
-    person(d, 280, 760, 62, AMBER, a, 5)
-    text(d, "我", 280, 1010, 36, AMBER, a)
-    a = fade(t, ts[2])
-    bubble(d, 270, 470, 175, 115, VIOLET, a, 3, fill=(VIOLET, 0.08), tail=(280, 680))
-    rich(d, [("g", VIOLET), ("(", VIOLET), ("f", CYAN), ("(", CYAN), ("X", AMBER), (")", CYAN),
-             (")", VIOLET)], 270, 470, 54, a, "serif")
-    arrow(d, 455, 470, 600, 470, VIOLET, a, (t - ts[2]) / 0.6, 3, dashed=True)
-    text(d, "推测", 528, 432, 30, VIOLET, fade(t, ts[2] + 0.5))
-    a = fade(t, ts[3])
-    rich(d, [("g", VIOLET), ("：我对别人看法的推测", TEXT)], 540, 1110, 36, a, "sans")
-    conclusion(d, "引理二", "我能接触的，只有 g(f(X))", 1215, fade(t, ts[3] + 1.0), VIOLET)
-
-
-def sc_step3(d, t, ts):
-    items = ["出门前换掉的衣服", "发送前删掉的句子", "会上没说出口的想法"]
-    ys = [440, 600, 760]
-    for i, s in enumerate(items):
-        a = fade(t, ts[i + 1])
-        dx = (1 - a) * -40
-        rrect(d, 70 + dx, ys[i] - 55, 600 + dx, ys[i] + 55, TEXT, a * 0.5, 2, fill=(TEXT, 0.05))
-        text(d, s, 335 + dx, ys[i], 38, TEXT, a)
-    # 候选决定因素
-    a4 = fade(t, ts[4])
-    rrect(d, 730, 395, 1000, 505, CYAN, a4, 3, fill=(CYAN, 0.08))
-    rich(d, [("f", CYAN), ("(", CYAN), ("X", AMBER), (")", CYAN)], 865, 440, 50, a4, "serif")
-    text(d, "别人真实的看法", 865, 485, 22, MUTED, a4, "sans")
-    for i in range(3):
-        arrow(d, 612, ys[i], 718, 450, MUTED, a4 * 0.6, (t - ts[4] - 0.1 * i) / 0.5, 3, dashed=True)
-    x_ = fade(t, ts[4] + 1.0, 0.3)
-    if x_ > 0:
-        d.line(P(745, 410, 745 + 240 * x_, 410 + 80 * x_), fill=C(RED, x_), width=5 * S)
-        d.line(P(985, 410, 985 - 240 * x_, 410 + 80 * x_), fill=C(RED, x_), width=5 * S)
-    a5 = fade(t, ts[5])
-    rrect(d, 730, 655, 1000, 785, VIOLET, a5, 4, fill=(VIOLET, 0.14))
-    rich(d, [("g", VIOLET), ("(", VIOLET), ("f", CYAN), ("(", CYAN), ("X", AMBER), (")", CYAN),
-             (")", VIOLET)], 865, 705, 48, a5, "serif")
-    text(d, "我以为的看法", 865, 757, 24, VIOLET, a5, "sans")
-    for i in range(3):
-        arrow(d, 612, ys[i], 718, 720, VIOLET, a5, (t - ts[5] - 0.12 * i) / 0.5, 4)
-    text(d, "决定因素", 865, 830, 30, VIOLET, fade(t, ts[5] + 0.7))
-    conclusion(d, "引理三", "决定行为的是 g(f(X))，而非 f(X)", 1060,
-               fade(t, ts[5] + 1.2), VIOLET)
-
-
-def sc_qed(d, t, ts):
-    rich(d, [("∵  言行、选择、情绪  ←  ", TEXT), ("g", VIOLET), ("(", VIOLET), ("f", CYAN),
-             ("(", CYAN), ("X", AMBER), (")", CYAN), (")", VIOLET)], 540, 450, 46, fade(t, ts[0]), "bold")
-    rich(d, [("∴  塑造“我”的  =  ", TEXT), ("g", VIOLET), ("(", VIOLET), ("f", CYAN),
-             ("(", CYAN), ("X", AMBER), (")", CYAN), (")", VIOLET)], 540, 560, 46, fade(t, ts[1]), "bold")
-    a = fade(t, ts[1] + 1.2, 0.6)
-    rrect(d, 80, 680, 1000, 960, AMBER, a * 0.7, 3, fill=(AMBER, 0.06), r=28)
-    rich(d, [("我眼中的", VIOLET), ("别人眼中的", CYAN), ("我", AMBER)], 540, 765, 66, a, "serif")
-    rich(d, [("=  真正的我", TEXT)], 540, 875, 70, a, "serif")
-    a = fade(t, ts[2], 0.35)
-    sc = 1 + 0.4 * (1 - a)
-    d.rectangle(P(395 - 22 * sc, 1110 - 22 * sc, 395 + 22 * sc, 1110 + 22 * sc), fill=C(AMBER, a))
-    text(d, "证毕", 560, 1106, 90 if a >= 1 else int(90 * sc), AMBER, a, "serif")
-
-
-def sc_theory(d, t, ts):
-    tag(d, "理论依据", 540, 420, 34, AMBER, fade(t, ts[0]))
-    a = fade(t, ts[1])
-    text(d, "镜中自我", 540, 560, 104, TEXT, a, "serif")
-    text(d, "Looking-glass Self", 540, 668, 40, MUTED, a, "sans")
-    text(d, "C. H. Cooley, 1902", 540, 725, 32, MUTED, a, "sans")
-    rows = ["想象自己在他人眼中的形象", "想象他人对这一形象的评价", "由此产生自豪或羞愧等自我感受"]
-    cols = [AMBER, CYAN, VIOLET]
-    for i, s in enumerate(rows):
-        a = fade(t, ts[2] + 0.5 * i)
-        y = 860 + i * 125
-        rrect(d, 90, y - 50, 990, y + 50, cols[i], a * 0.7, 2, fill=(cols[i], 0.07))
-        circle(d, 145, y, 26, cols[i], a, 3, fill=(cols[i], 0.2))
-        text(d, str(i + 1), 145, y - 2, 30, cols[i], a, "serif")
-        text(d, s, 195, y, 36, TEXT, a, "bold", "lm")
-
-
-def sc_mirror(d, t, ts):
-    cx, cy, rx, ry = 540, 690, 210, 290
-    a = fade(t, ts[0])
-    d.ellipse(P(cx - rx - 22, cy - ry - 22, cx + rx + 22, cy + ry + 22), outline=C(AMBER, a * 0.9),
-              width=10 * S)
-    d.ellipse(P(cx - rx, cy - ry, cx + rx, cy + ry), fill=C((40, 46, 58), a))
-    d.line(P(cx, cy + ry + 22, cx, cy + ry + 70), fill=C(AMBER, a * 0.9), width=8 * S)
-    d.line(P(cx - 90, cy + ry + 72, cx + 90, cy + ry + 72), fill=C(AMBER, a * 0.9), width=8 * S)
-    clean = fade(t, ts[3] + 0.4, 1.4)
-    a1 = fade(t, ts[1]) * (1 - clean)
-    blob(d, cx, cy - 40, 120, VIOLET, a1, seed=7, amp=0.32, t=t * 1.5, width=4)
-    # 放大的缺点 / 被忽略的优点
-    a2 = fade(t, ts[2]) * (1 - clean)
-    tag(d, "缺点 ×3", 205, 470, 34, RED, a2)
-    tag(d, "优点 ×0.3", 880, 910, 26, MUTED, a2 * 0.8)
-    if clean > 0:
-        circle(d, cx, cy - 40, 120, AMBER, clean, 5, fill=(AMBER, 0.14))
-        text(d, "X", cx, cy - 48, 110, AMBER, clean, "serif")
-        for i in range(4):   # 擦亮后的高光
-            ang = 0.6 + i * 1.6
-            sx, sy = cx + 160 * math.cos(ang), cy - 40 + 200 * math.sin(ang)
-            s = 14 * clean * (0.7 + 0.3 * math.sin(t * 4 + i))
-            d.polygon([tuple(P(sx, sy - s)), tuple(P(sx + s * 0.3, sy)), tuple(P(sx, sy + s)),
-                       tuple(P(sx - s * 0.3, sy))], fill=C(TEXT, clean))
-    a = fade(t, ts[4], 0.6)
-    text(d, "你心里的那面镜子，", 540, 1140, 58, TEXT, a, "serif")
-    text(d, "照出的是怎样的你？", 540, 1230, 58, AMBER, a, "serif")
-
-
-DRAW = {"hook": sc_hook, "define": sc_define, "step1": sc_step1, "step2": sc_step2,
-        "step3": sc_step3, "qed": sc_qed, "theory": sc_theory, "mirror": sc_mirror}
+def captions(d, sc, t):
+    """文案：按句出现；keep 的句子与下一句上下并列。"""
+    lines = sc["lines"]
+    groups, cur = [], []
+    for ln in lines:
+        cur.append(ln)
+        if not ln.get("keep"):
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    for gi, g in enumerate(groups):
+        g_end = groups[gi + 1][0]["t0"] if gi + 1 < len(groups) else sc["end"] + 10
+        if not (g[0]["t0"] - 0.1 <= t < g_end + 0.1):
+            continue
+        out = 1 - fade(t, g_end - 0.45, 0.45)
+        final = g[-1].get("final")
+        size = 72 if final else 60
+        rows = []
+        for ln in g:
+            for r in wrap(ln["show"], size, 820):
+                rows.append((r, ln))
+        step = size * 1.55
+        y0 = TEXT_Y - (len(rows) - 1) * step / 2
+        for i, (r, ln) in enumerate(rows):
+            a = fade(t, ln["t0"] - 0.1, 0.7) * out
+            text(d, r, 540, y0 + i * step, size, INK, a, "bold" if final else "serif")
+        note = next((ln for ln in g if ln.get("note")), None)
+        if note:
+            text(d, note["note"], 540, y0 + len(rows) * step + 10, 30, GREY,
+                 fade(t, note["t1"], 0.8) * out, "light")
 
 
 # ---------------------------------------------------------------- 逐帧渲染
@@ -545,60 +534,49 @@ TL = None
 
 
 def background():
-    img = Image.new("RGB", (W * S, H * S), BG)
-    d = ImageDraw.Draw(img)
-    for y in range(60, H, 60):
-        for x in range(60, W, 60):
-            d.ellipse(P(x - 1.2, y - 1.2, x + 1.2, y + 1.2), fill=(24, 28, 37))
-    return img
-
-
-def header(d, sc, t):
-    global GA
-    keep = GA
-    GA = 1.0
-    text(d, "一句绕口话的“严格证明”", 540, 165, 34, MUTED, 1.0, "serif")
-    if sc["step"] is not None:
-        xs = [190 + 175 * i for i in range(5)]
-        for i, s in enumerate(STEPS):
-            cur = i == sc["step"]
-            col = AMBER if cur else (TEXT if i < sc["step"] else DIM)
-            text(d, s, xs[i], 240, 30, col, 1.0, "bold")
-            if cur:
-                d.line(P(xs[i] - 34, 268, xs[i] + 34, 268), fill=C(AMBER), width=4 * S)
-    GA = keep
-
-
-def subtitle(d, sc, t):
-    global GA
-    keep = GA
-    for ln in sc["lines"]:
-        nxt = [l["t0"] for l in sc["lines"] if l["t0"] > ln["t0"]]
-        t_end = (nxt[0] if nxt else sc["end"] - 0.15) - 0.02
-        if ln["t0"] - 0.05 <= t < t_end:
-            GA = min(fade(t, ln["t0"] - 0.05, 0.15), 1 - fade(t, t_end - 0.12, 0.12))
-            rows = wrap(ln["show"], 50, 860)
-            y0 = 1430 - (len(rows) - 1) * 36
-            for i, r in enumerate(rows):
-                text(d, r, 540, y0 + i * 72, 50, TEXT, 1.0, "bold")
-    GA = keep
+    """宣纸质感：低频纤维噪声 + 暗角。"""
+    rng = np.random.default_rng(3)
+    small = rng.normal(0, 1, (H // 4, W // 4)).astype(np.float32)
+    n1 = np.array(Image.fromarray(((small * 18) + 128).clip(0, 255).astype(np.uint8))
+                  .resize((W * S, H * S), Image.BICUBIC)
+                  .filter(ImageFilter.GaussianBlur(6)), dtype=np.float32) - 128
+    fine = rng.normal(0, 3.0, (H * S, W * S)).astype(np.float32)
+    yy, xx = np.mgrid[0:H * S, 0:W * S].astype(np.float32)
+    vig = ((xx / (W * S) - 0.5) ** 2 + (yy / (H * S) - 0.5) ** 2) * 38
+    base = np.array(PAPER, dtype=np.float32)[None, None, :]
+    img = base + (n1 * 0.35 + fine - vig)[:, :, None] * np.array([1.0, 1.0, 1.05])[None, None, :]
+    return Image.fromarray(img.clip(0, 255).astype(np.uint8))
 
 
 def render(i):
-    global GA
-    t = i / FPS
+    global GA, t_global
+    t = t_global = i / FPS
     sc = next((s for s in TL if s["start"] <= t < s["end"]), TL[-1])
     lt = t - sc["start"]
     img = _bg.copy()
     d = ImageDraw.Draw(img)
-    header(d, sc, t)
     last = sc is TL[-1]
-    GA = min(fade(lt, 0, 0.35), 1.0 if last else 1 - fade(t, sc["end"] - 0.35, 0.35))
+    first = sc is TL[0]
+    GA = min(1.0 if first else fade(lt, 0, 0.5), 1.0 if last else 1 - fade(t, sc["end"] - 0.5, 0.5))
     ts = [ln["t0"] - sc["start"] for ln in sc["lines"]]
     DRAW[sc["key"]](d, lt, ts)
     GA = 1.0
-    subtitle(d, sc, t)
+    captions(d, sc, t)
     return img.reduce(S).tobytes()
+
+
+def render_cover(path):
+    """封面：圆相 + 标题。"""
+    global GA
+    GA = 1.0
+    img = _bg.copy()
+    d = ImageDraw.Draw(img)
+    enso(d, 540, 760, 300, 1.0, INK, 1.0, 40, seed=1)
+    vtext(d, "照见", 540, 660, 150, INK, 1.0, "bold", 1.3)
+    text(d, "你在意的，", 540, 1300, 72, INK, 1.0, "serif")
+    text(d, "从来不是别人的眼光", 540, 1410, 72, INK, 1.0, "serif")
+    seal(d, "禅心", 870, 1560, 34, 1.0)
+    img.reduce(S).save(path)
 
 
 def init_worker(args, tl):
@@ -612,19 +590,20 @@ def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
     ap.add_argument("--assets", default=os.path.join(here, "assets"))
-    ap.add_argument("--out", default=os.path.join(here, "looking_glass_self.mp4"))
+    ap.add_argument("--out", default=os.path.join(here, "zhaojian.mp4"))
+    ap.add_argument("--cover", default=None, help="同时导出封面 PNG")
     ap.add_argument("--preview", type=float, default=None, help="仅导出某一时刻的单帧 PNG")
-    ap.add_argument("--cover", default=None, help="同时导出封面 PNG 的路径")
+    ap.add_argument("--voice", default=os.environ.get("MINIMAX_VOICE", "Chinese (Mandarin)_Gentleman"))
+    ap.add_argument("--model", default=os.environ.get("MINIMAX_MODEL", "speech-02-hd"))
+    ap.add_argument("--speed", type=float, default=0.9)
     ARGS = ap.parse_args()
 
-    voice = synth_lines(ARGS.assets, os.path.join(ARGS.assets, "tts_cache"))
+    voice = synth_lines(ARGS)
     tl, total = build_timeline(voice)
     print(f"总时长 {total:.1f} s")
     for s in tl:
         print(f"  {s['key']:7s} {s['start']:6.2f} – {s['end']:6.2f}")
-    light = [{k: v for k, v in s.items()} for s in tl]
-    for s in light:
-        s["lines"] = [{k: v for k, v in l.items() if k != "audio"} for l in s["lines"]]
+    light = [dict(s, lines=[{k: v for k, v in l.items() if k != "audio"} for l in s["lines"]]) for s in tl]
 
     if ARGS.preview is not None:
         init_worker(ARGS, light)
@@ -638,9 +617,9 @@ def main():
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
          "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-i", wav,
-         "-c:v", "libx264", "-preset", "medium", "-crf", "21", "-pix_fmt", "yuv420p",
-         "-af", "loudnorm=I=-15:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart",
-         "-shortest", ARGS.out], stdin=subprocess.PIPE)
+         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+         "-af", "loudnorm=I=-15:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
+         "-movflags", "+faststart", "-shortest", ARGS.out], stdin=subprocess.PIPE)
     with Pool(os.cpu_count(), initializer=init_worker, initargs=(ARGS, light)) as pool:
         for k, buf in enumerate(pool.imap(render, range(nframes), chunksize=8)):
             ff.stdin.write(buf)
@@ -651,7 +630,7 @@ def main():
     os.remove(wav)
     if ARGS.cover:
         init_worker(ARGS, light)
-        Image.frombytes("RGB", (W, H), render(int(2.0 * FPS))).save(ARGS.cover)
+        render_cover(ARGS.cover)
     print("完成：", ARGS.out)
 
 
