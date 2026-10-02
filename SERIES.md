@@ -54,7 +54,7 @@
 ## 制作方式
 
 ```bash
-export MINIMAX_API_KEY=...
+# 密钥保存在仓库根目录的 .minimax_key（不提交），详见 MINIMAX_TTS.md
 python3 ep02-mars-sunset/make_video.py --cover cover   # 同时输出 9:16、3:4、4:3 三种封面
 ```
 

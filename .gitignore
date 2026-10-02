@@ -1,1 +1,4 @@
 __pycache__/
+# MiniMax 密钥，切勿提交
+.minimax_key
+.env

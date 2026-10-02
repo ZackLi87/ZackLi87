@@ -145,6 +145,10 @@ class LocalTTS:
 
 def make_tts(args):
     key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    kf = os.environ.get("MINIMAX_KEY_FILE", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                         ".minimax_key"))
+    if not key and os.path.exists(kf):
+        key = open(kf, encoding="utf-8").read().strip()
     if key:
         hosts = [h for h in [os.environ.get("MINIMAX_API_HOST")] if h] or \
             ["api.minimaxi.com", "api.minimax.io"]

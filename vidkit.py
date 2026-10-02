@@ -4,8 +4,8 @@ vidkit：竖屏科普短视频的通用生成流程。
 各期视频只需提供：分镜文案（SCENES）、逐帧绘制函数、背景音乐函数；
 语音合成、时间轴排布、混音、多进程渲染与编码由本模块完成。
 
-语音：设置环境变量 MINIMAX_API_KEY 时使用 MiniMax T2A（api.minimaxi.com），
-否则回退到离线 sherpa-onnx 模型（需 assets/matcha-icefall-zh-baker 与 vocoder）。
+语音：读取到 MiniMax 密钥（环境变量 MINIMAX_API_KEY 或仓库根目录的 .minimax_key 文件）时使用
+MiniMax T2A（api.minimaxi.com），否则回退到离线 sherpa-onnx 模型。详见 MINIMAX_TTS.md。
 """
 import hashlib
 import json
@@ -97,8 +97,24 @@ class LocalTTS:
             w.writeframes(s.tobytes())
 
 
-def make_tts(assets, voice, model="speech-2.6-hd", speed=1.0, emotion=None):
+KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".minimax_key")
+
+
+def minimax_key():
+    """读取 MiniMax 密钥：优先环境变量 MINIMAX_API_KEY，其次 MINIMAX_KEY_FILE 指定的文件，
+    最后是仓库根目录的 .minimax_key（已列入 .gitignore，不会被提交）。"""
     key = os.environ.get("MINIMAX_API_KEY", "").strip()
+    if key:
+        return key
+    path = os.environ.get("MINIMAX_KEY_FILE", KEY_FILE)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+
+def make_tts(assets, voice, model="speech-2.6-hd", speed=1.0, emotion=None):
+    key = minimax_key()
     if key:
         return MiniMaxTTS(key, voice, model, speed, emotion)
     print("未设置 MINIMAX_API_KEY，使用离线语音模型")
