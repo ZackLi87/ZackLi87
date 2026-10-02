@@ -5,7 +5,7 @@ vidkit：竖屏科普短视频的通用生成流程。
 语音合成、时间轴排布、混音、多进程渲染与编码由本模块完成。
 
 语音：读取到 MiniMax 密钥（环境变量 MINIMAX_API_KEY 或仓库根目录的 .minimax_key 文件）时使用
-MiniMax T2A（api.minimaxi.com），否则回退到离线 sherpa-onnx 模型。详见 MINIMAX_TTS.md。
+MiniMax T2A（api.minimaxi.com），否则回退到离线 sherpa-onnx 模型。调用方法见 minimax-tts/README.md。
 """
 import hashlib
 import json
@@ -98,18 +98,19 @@ class LocalTTS:
 
 
 KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".minimax_key")
+KEY_FILE2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minimax-tts", "minimax_key.txt")
 
 
 def minimax_key():
     """读取 MiniMax 密钥：优先环境变量 MINIMAX_API_KEY，其次 MINIMAX_KEY_FILE 指定的文件，
-    最后是仓库根目录的 .minimax_key（已列入 .gitignore，不会被提交）。"""
+    再次是仓库根目录的 .minimax_key，最后是 minimax-tts/minimax_key.txt（均已列入 .gitignore）。"""
     key = os.environ.get("MINIMAX_API_KEY", "").strip()
     if key:
         return key
-    path = os.environ.get("MINIMAX_KEY_FILE", KEY_FILE)
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip()
+    for path in (os.environ.get("MINIMAX_KEY_FILE"), KEY_FILE, KEY_FILE2):
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
     return ""
 
 

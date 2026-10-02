@@ -54,7 +54,7 @@
 ## 制作方式
 
 ```bash
-# 密钥保存在仓库根目录的 .minimax_key（不提交），详见 MINIMAX_TTS.md
+# 密钥粘贴到 minimax-tts/minimax_key.txt（不提交），调用方法见 minimax-tts/README.md
 python3 ep02-mars-sunset/make_video.py --cover cover   # 同时输出 9:16、3:4、4:3 三种封面
 ```
 
