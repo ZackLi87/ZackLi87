@@ -190,11 +190,16 @@ def subtitle(d, sc, t):
         t_end = lines[i + 1]["t0"] if i + 1 < len(lines) else sc["end"] - 0.1
         if ln["t0"] - 0.08 <= t < t_end:
             a = min(vk.fade(t, ln["t0"] - 0.08, 0.12), 1 - vk.fade(t, t_end - 0.1, 0.1))
-            rows = vk.wrap_balanced(ln["show"], lambda s: F("bold", 54).getlength(s) / S, 900,
-                                    "，、：；！？")
-            y0 = 1470 - (len(rows) - 1) * 38
+            size = 54
+            while True:                                              # 两行仍放不下时缩小字号
+                rows = vk.wrap_balanced(ln["show"], lambda s: F("bold", size).getlength(s) / S, 900,
+                                        "，、：；！？")
+                if size <= 40 or max(F("bold", size).getlength(r) / S for r in rows) <= 980:
+                    break
+                size -= 4
+            y0 = 1470 - (len(rows) - 1) * size * 0.7
             for k, r in enumerate(rows):
-                text(d, r, 540, y0 + k * 76, 54, WHITE, a, stroke=7)
+                text(d, r, 540, y0 + k * size * 1.4, size, WHITE, a, stroke=7)
 
 
 # ---------------------------------------------------------------- 渲染框架
