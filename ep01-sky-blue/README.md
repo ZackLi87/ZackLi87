@@ -3,7 +3,7 @@
 少儿科普竖屏短视频（1080×1920，30 fps，约 76 s），面向抖音发布。系列名“好奇心实验室 · 第 1 期”
 可在 `make_video.py` 顶部的 `SERIES` 中修改。
 
-- 成片：[`sky_blue.mp4`](sky_blue.mp4)
+- 成片：[`sky_blue.mp4`](sky_blue.mp4)（第 1 期；系列目录见仓库根目录 `SERIES.md`）
 - 封面：[`cover.jpg`](cover.jpg)
 
 ## 内容结构
@@ -58,4 +58,4 @@ python3 make_video.py --preview 30       # 仅导出单帧
 ```
 
 可用 `--voice`、`--speed`、`--emotion` 调整配音。通用流程（语音合成、时间轴、混音、渲染编码）
-位于仓库根目录的 `vidkit.py`，后续各期可直接复用。
+位于仓库根目录的 `vidkit.py`；第 2 期起的画面风格统一由 `kidkit.py` 提供。
