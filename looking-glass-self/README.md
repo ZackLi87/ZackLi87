@@ -1,6 +1,6 @@
 # 照见
 
-竖屏短视频（1080×1920，30 fps，约 50–60 s），面向抖音发布。以水墨、禅意的方式重述一句话：
+竖屏短视频（1080×1920，30 fps，约 58 s），面向抖音发布。以水墨、禅意的方式重述一句话：
 
 > 别人眼中的自己，不是真的自己；我眼中的别人眼中的自己，才是真的自己。
 
@@ -41,7 +41,7 @@ python3 make_video.py --cover cover.jpg
 python3 make_video.py --preview 30       # 仅导出第 30 秒的单帧，便于调整版式
 ```
 
-MiniMax 相关的可选环境变量：`MINIMAX_VOICE`（音色 ID）、`MINIMAX_MODEL`（默认 `speech-02-hd`）、
+MiniMax 相关的可选环境变量：`MINIMAX_VOICE`（音色 ID，默认“电台男主播” `Chinese (Mandarin)_Radio_Host`；亦可选“温润男声” `Chinese (Mandarin)_Gentleman`、“抒情男声” `Chinese (Mandarin)_Lyrical_Voice`）、`MINIMAX_MODEL`（默认 `speech-2.6-hd`）、
 `MINIMAX_API_HOST`（默认依次尝试 `api.minimaxi.com` 与 `api.minimax.io`）；语速用 `--speed` 调整。
 密钥只从环境变量读取，切勿写入仓库。
 

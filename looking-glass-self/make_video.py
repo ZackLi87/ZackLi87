@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import urllib.request
 import wave
@@ -33,11 +34,12 @@ GREY = (128, 120, 110)                # 淡墨
 FAINT = (205, 197, 184)               # 极淡墨
 SEAL = (176, 48, 38)                  # 朱砂印
 
-LEAD, GAP, TAIL, FINAL_HOLD = 0.55, 0.42, 0.75, 3.2
+LEAD, GAP, TAIL, FINAL_HOLD = 0.55, 0.55, 0.8, 3.2
 TEXT_Y = 1330                         # 文案区中心
 
 # ---------------------------------------------------------------- 文案
-# show：画面文字；say：旁白（缺省同 show）；keep：下一句出现时保留并与之上下排列；
+# show：画面文字；say：旁白（缺省同 show，可含 MiniMax 停顿标记 <#秒#>）；
+# keep：下一句出现时保留并与之上下排列；
 # note：出处等小字。
 SCENES = [
     dict(key="enso", lines=[
@@ -57,15 +59,15 @@ SCENES = [
         dict(show="都在回应那个“以为”。"),
     ]),
     dict(key="flag", lines=[
-        dict(show="不是风动，不是幡动，", keep=True),
-        dict(show="仁者心动。", note="——《六祖坛经》"),
+        dict(show="不是风动，不是幡动，", say="不是风动，<#0.3#>不是幡动，", keep=True),
+        dict(show="仁者心动。", say="仁者<#0.25#>心动。", note="——《六祖坛经》"),
         dict(show="照见你的，从来是你自己的心。"),
     ]),
     dict(key="mirror", lines=[
         dict(show="心镜蒙尘，处处都是审视；", keep=True),
         dict(show="拂去尘埃，"),
         dict(show="别人如何看你，便只是别人的事。"),
-        dict(show="愿你照见，本来面目。", final=True),
+        dict(show="愿你照见，本来面目。", say="愿你照见，<#0.4#>本来面目。", final=True),
     ]),
 ]
 
@@ -158,6 +160,8 @@ def synth_lines(args):
     for si, sc in enumerate(SCENES):
         for ln in sc["lines"]:
             say = ln.get("say", ln["show"])
+            if not isinstance(tts, MiniMaxTTS):
+                say = re.sub(r"<#[\d.]+#>", "", say)
             h = hashlib.md5(f"{tts.tag}|{say}".encode()).hexdigest()
             npy = os.path.join(cache, h + ".npy")
             if not os.path.exists(npy):
@@ -593,9 +597,9 @@ def main():
     ap.add_argument("--out", default=os.path.join(here, "zhaojian.mp4"))
     ap.add_argument("--cover", default=None, help="同时导出封面 PNG")
     ap.add_argument("--preview", type=float, default=None, help="仅导出某一时刻的单帧 PNG")
-    ap.add_argument("--voice", default=os.environ.get("MINIMAX_VOICE", "Chinese (Mandarin)_Gentleman"))
-    ap.add_argument("--model", default=os.environ.get("MINIMAX_MODEL", "speech-02-hd"))
-    ap.add_argument("--speed", type=float, default=0.9)
+    ap.add_argument("--voice", default=os.environ.get("MINIMAX_VOICE", "Chinese (Mandarin)_Radio_Host"))
+    ap.add_argument("--model", default=os.environ.get("MINIMAX_MODEL", "speech-2.6-hd"))
+    ap.add_argument("--speed", type=float, default=0.82)
     ARGS = ap.parse_args()
 
     voice = synth_lines(ARGS)
